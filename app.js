@@ -1,7 +1,5 @@
-import * as THREE from 'https://unpkg.com/three@0.128.0/build/three.module.js';
-import { OrbitControls } from 'https://unpkg.com/three@0.128.0/examples/jsm/controls/OrbitControls.js';
-
 const scene = new THREE.Scene();
+const OrbitControls = THREE.OrbitControls;
 scene.background = new THREE.Color(0x030617);
 scene.fog = new THREE.FogExp2(0x030617, 0.0055);
 
@@ -34,22 +32,24 @@ const rimLight = new THREE.PointLight(0xffaa66, 0.35);
 rimLight.position.set(-2, 1, -3);
 scene.add(rimLight);
 
-function addAxisArrow(dir, origin, color, length = 3.5) {
-  scene.add(new THREE.ArrowHelper(new THREE.Vector3(dir.x, dir.y, dir.z).normalize(), origin, length, color, 0.25, 0.15));
+function addAxisArrow(dir, origin, color, length = 2.8) {
+  scene.add(new THREE.ArrowHelper(new THREE.Vector3(dir.x, dir.y, dir.z).normalize(), origin, length, color, 0.08, 0.04));
 }
-function createTextLabel(text, position, color = "#ffffff") {
+function createTextLabel(text, position, color = "#ffffff", options = {}) {
+  const fontSize = options.fontSize || 48;
+  const scale = options.scale || 1;
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = 512;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = "rgba(0,0,0,0)";
   ctx.fillRect(0, 0, 512, 512);
   ctx.fillStyle = color;
-  ctx.font = "bold 48px Arial";
+  ctx.font = `bold ${fontSize}px Arial`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(text, 256, 256);
   const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas) }));
-  sprite.scale.set(1, 1, 1);
+  sprite.scale.set(scale, scale, scale);
   sprite.position.copy(position);
   scene.add(sprite);
   return sprite;
@@ -73,7 +73,7 @@ function createEmojiSprite(emoji, position, size, font = 220) {
 }
 function createEarthGlobe() {
   const group = new THREE.Group();
-  const radius = 1.18;
+  const radius = EARTH_MODEL_RADIUS;
 
   const sphere = new THREE.Mesh(
     new THREE.SphereGeometry(radius, 72, 72),
@@ -106,10 +106,15 @@ function createEarthGlobe() {
   );
   group.add(atmosphere);
 
-  group.scale.setScalar(0.57);
+  group.scale.setScalar(EARTH_MODEL_SCALE);
   scene.add(group);
   return { group, sphere, clouds };
 }
+const EARTH_MODEL_RADIUS = 1.18;
+const EARTH_MODEL_SCALE = 0.43;
+const EARTH_VISUAL_RADIUS = EARTH_MODEL_RADIUS * EARTH_MODEL_SCALE;
+const ORBIT_CLEARANCE_MARGIN = 0.14;
+const MIN_PERIGEE_RADIUS = EARTH_VISUAL_RADIUS + ORBIT_CLEARANCE_MARGIN;
 function createEarthTexture() {
   const canvas = document.createElement('canvas');
   canvas.width = 1024;
@@ -236,9 +241,9 @@ const originPt = new THREE.Vector3(0, 0, 0);
 addAxisArrow(new THREE.Vector3(1, 0, 0), originPt, 0xff6666, 2.8);
 addAxisArrow(new THREE.Vector3(0, 1, 0), originPt, 0x66ff66, 2.8);
 addAxisArrow(new THREE.Vector3(0, 0, 1), originPt, 0x66aaff, 2.8);
-createTextLabel("Vernal equinox", new THREE.Vector3(2.9, 0, 0), "#ff6666");
-createTextLabel("Y-axis", new THREE.Vector3(0, 3.1, 0), "#66ff66");
-createTextLabel("North pole", new THREE.Vector3(0, 0, 2.9), "#66aaff");
+createTextLabel("Vernal equinox", new THREE.Vector3(2.9, 0, 0), "#ff6666", { fontSize: 34, scale: 0.78 });
+createTextLabel("Y-axis", new THREE.Vector3(0, 3.1, 0), "#66ff66", { fontSize: 42, scale: 0.9 });
+createTextLabel("North pole", new THREE.Vector3(0, 0, 2.9), "#66aaff", { fontSize: 42, scale: 0.9 });
 
 const equatorialPlane = new THREE.Mesh(
   new THREE.CircleGeometry(2.4, 64),
@@ -253,7 +258,7 @@ function initOrbitalDisc() {
   if (orbitalDisc) scene.remove(orbitalDisc);
   orbitalDisc = new THREE.Mesh(
     new THREE.CircleGeometry(2.15, 96),
-    new THREE.MeshPhongMaterial({ color: 0x55606f, side: THREE.DoubleSide, transparent: true, opacity: 0.12 })
+    new THREE.MeshPhongMaterial({ color: 0xffa443, side: THREE.DoubleSide, transparent: true, opacity: 0.08 })
   );
   scene.add(orbitalDisc);
 }
@@ -262,14 +267,17 @@ initOrbitalDisc();
 let nodeLineObj = null, perigeeArrow = null, smallDirectionArrow = null;
 let hLabel = null, perigeeLabel = null, hArrow = null;
 let satelliteMarker = null, satelliteLine = null, orbitPathLine = null;
-let prevNuDeg = 60, prevOmegaDeg = 30;
+let satGlow = null;
+let nodeSpheres = [];
 let semiMajorA = 2.0;
 let motionEnabled = false;
-let motionAngleDeg = 60;
+let motionNuDeg = 60;
 let orbitDirection = 1;
-const motionSpeedDegPerSec = 18;
 const earthSpinSpeed = 0.0035;
 const MAX_DRAW_R = 60;
+const TWO_PI = Math.PI * 2;
+const DEG2RAD = Math.PI / 180;
+const RAD2DEG = 180 / Math.PI;
 const defaultState = {
   a: 2.0,
   e: 0.0,
@@ -278,6 +286,70 @@ const defaultState = {
   omega: 30,
   nu: 60
 };
+let lastInclinationDeg = defaultState.i;
+let currentOrbitE = defaultState.e;
+let motionMeanAnomaly = 0;
+let motionHyperbolicAnomaly = 0;
+let motionParabolicB = 0;
+let orbitStaticSignature = "";
+let orbitPerigeeRadius = Math.max(defaultState.a * (1 - defaultState.e), MIN_PERIGEE_RADIUS);
+motionNuDeg = defaultState.nu;
+
+const ANGLE_DECIMALS = 1;
+const VALUE_DECIMALS = {
+  a: 2,
+  e: 2,
+  angle: 0,
+  motionAngle: 1
+};
+const VISIBILITY_EPS = 1e-4;
+
+function roundTo(value, decimals) {
+  const factor = Math.pow(10, decimals);
+  return Math.round(value * factor) / factor;
+}
+function normalizeAngleDeg(angle) {
+  angle %= 360;
+  return angle < 0 ? angle + 360 : angle;
+}
+function normalizeMotionAngleDeg(angle) {
+  const rounded = roundTo(normalizeAngleDeg(angle), ANGLE_DECIMALS);
+  return rounded >= 360 ? 0 : rounded;
+}
+function removeFromScene(object) {
+  if (!object) return null;
+  scene.remove(object);
+  if (object.geometry && typeof object.geometry.dispose === 'function') {
+    object.geometry.dispose();
+  }
+  if (object.material) {
+    const materials = Array.isArray(object.material) ? object.material : [object.material];
+    materials.forEach((material) => {
+      if (material.map && typeof material.map.dispose === 'function') {
+        material.map.dispose();
+      }
+      if (typeof material.dispose === 'function') material.dispose();
+    });
+  }
+  return null;
+}
+function formatAngleText(value, decimals = 0) {
+  return `${roundTo(value, decimals).toFixed(decimals)}°`;
+}
+function updateLineGeometry(line, start, end) {
+  if (!line) return;
+  const geometry = line.geometry;
+  const positions = geometry && geometry.attributes && geometry.attributes.position;
+  if (positions && positions.count >= 2) {
+    positions.setXYZ(0, start.x, start.y, start.z);
+    positions.setXYZ(1, end.x, end.y, end.z);
+    positions.needsUpdate = true;
+    geometry.computeBoundingSphere();
+    return;
+  }
+  if (geometry && typeof geometry.dispose === 'function') geometry.dispose();
+  line.geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
+}
 
 function getSemiLatusRectum(e) {
   if (e < 1.0) return semiMajorA * (1 - e * e);
@@ -290,6 +362,131 @@ function getOrbitRadius(e, nu_rad) {
   if (denom <= 0.01) return Infinity;
   return p / denom;
 }
+function normalizeAngleRad(angle) {
+  angle %= TWO_PI;
+  return angle < 0 ? angle + TWO_PI : angle;
+}
+function trueAnomalyToEllipticEccentricAnomaly(nu, e) {
+  return 2 * Math.atan2(
+    Math.sqrt(1 - e) * Math.sin(nu / 2),
+    Math.sqrt(1 + e) * Math.cos(nu / 2)
+  );
+}
+function trueAnomalyToHyperbolicAnomaly(nu, e) {
+  return 2 * Math.atanh(Math.sqrt((e - 1) / (e + 1)) * Math.tan(nu / 2));
+}
+function trueAnomalyToParabolicParameter(nu) {
+  return Math.tan(nu / 2);
+}
+function meanAnomalyFromTrueAnomaly(nu, e) {
+  if (e < 1 - 1e-6) {
+    const E = trueAnomalyToEllipticEccentricAnomaly(nu, e);
+    return E - e * Math.sin(E);
+  }
+  if (e > 1 + 1e-6) {
+    const F = trueAnomalyToHyperbolicAnomaly(nu, e);
+    return e * Math.sinh(F) - F;
+  }
+  const D = trueAnomalyToParabolicParameter(nu);
+  return D + (D * D * D) / 3;
+}
+function trueAnomalyFromEllipticMeanAnomaly(M, e) {
+  let E = M;
+  for (let i = 0; i < 8; i++) {
+    const f = E - e * Math.sin(E) - M;
+    const fp = 1 - e * Math.cos(E);
+    E -= f / fp;
+  }
+  return 2 * Math.atan2(
+    Math.sqrt(1 + e) * Math.sin(E / 2),
+    Math.sqrt(1 - e) * Math.cos(E / 2)
+  );
+}
+function trueAnomalyFromHyperbolicMeanAnomaly(M, e) {
+  let F = Math.log(2 * Math.abs(M) / e + 1.8);
+  if (M < 0) F = -F;
+  for (let i = 0; i < 10; i++) {
+    const f = e * Math.sinh(F) - F - M;
+    const fp = e * Math.cosh(F) - 1;
+    F -= f / fp;
+  }
+  return 2 * Math.atan(Math.sqrt((e + 1) / (e - 1)) * Math.tanh(F / 2));
+}
+function trueAnomalyFromParabolicMeanAnomaly(M) {
+  let D = M;
+  for (let i = 0; i < 8; i++) {
+    const f = D + (D * D * D) / 3 - M;
+    const fp = 1 + D * D;
+    D -= f / fp;
+  }
+  return 2 * Math.atan(D);
+}
+function trueAnomalyFromMeanAnomaly(M, e) {
+  if (e < 1 - 1e-6) return trueAnomalyFromEllipticMeanAnomaly(M, e);
+  if (e > 1 + 1e-6) return trueAnomalyFromHyperbolicMeanAnomaly(M, e);
+  return trueAnomalyFromParabolicMeanAnomaly(M);
+}
+function getMotionRate() {
+  return 0.85 / Math.pow(Math.max(semiMajorA, 0.35), 1.5);
+}
+function getPerigeeRadiusFromOrbit(a, e) {
+  if (e < 1 - 1e-6) return a * (1 - e);
+  if (e > 1 + 1e-6) return a * (e - 1);
+  return a;
+}
+function getMinimumSemiMajorAxisForE(e) {
+  if (e < 1 - 1e-6) return MIN_PERIGEE_RADIUS / Math.max(1 - e, 1e-3);
+  if (e > 1 + 1e-6) return MIN_PERIGEE_RADIUS / Math.max(e - 1, 1e-3);
+  return MIN_PERIGEE_RADIUS;
+}
+function enforceOrbitClearance(e) {
+  const requiredA = getMinimumSemiMajorAxisForE(e);
+  if (semiMajorA >= requiredA - 1e-6) return false;
+  semiMajorA = roundTo(requiredA, VALUE_DECIMALS.a);
+  const aSlider = document.getElementById('aSlider');
+  const aInput = document.getElementById('aInput');
+  if (aSlider) aSlider.value = semiMajorA.toFixed(2);
+  if (aInput) aInput.value = semiMajorA.toFixed(2);
+  return true;
+}
+function getDirectionSign() {
+  return orbitDirection;
+}
+function getDirectionLabel() {
+  const isRetrogradeByInclination = lastInclinationDeg > 90;
+  const isRetrogradeMotion = orbitDirection > 0 ? isRetrogradeByInclination : !isRetrogradeByInclination;
+  return isRetrogradeMotion ? 'Retrograde motion' : 'Prograde motion';
+}
+function syncMotionFromTrueAnomaly(nuDeg, e) {
+  const nu = nuDeg * DEG2RAD;
+  currentOrbitE = e;
+  if (e < 1 - 1e-6) motionMeanAnomaly = meanAnomalyFromTrueAnomaly(nu, e);
+  else if (e > 1 + 1e-6) motionHyperbolicAnomaly = meanAnomalyFromTrueAnomaly(nu, e);
+  else motionParabolicB = trueAnomalyToParabolicParameter(nu);
+  motionNuDeg = normalizeMotionAngleDeg(nuDeg);
+}
+function advanceMotionPhase(dt, e) {
+  const delta = getMotionRate() * dt * getDirectionSign();
+  if (e < 1 - 1e-6) {
+    motionMeanAnomaly = normalizeAngleRad(motionMeanAnomaly + delta);
+    motionNuDeg = trueAnomalyFromMeanAnomaly(motionMeanAnomaly, e) * RAD2DEG;
+  } else if (e > 1 + 1e-6) {
+    motionHyperbolicAnomaly += delta;
+    motionNuDeg = trueAnomalyFromMeanAnomaly(motionHyperbolicAnomaly, e) * RAD2DEG;
+  } else {
+    motionParabolicB += delta;
+    motionNuDeg = trueAnomalyFromMeanAnomaly(motionParabolicB, e) * RAD2DEG;
+  }
+  motionNuDeg = normalizeMotionAngleDeg(motionNuDeg);
+}
+function updateMotionButtonLabel() {
+  const motionButton = document.getElementById('motionToggleBtn');
+  if (motionButton) motionButton.textContent = motionEnabled ? 'Stop Motion' : 'Start Motion';
+}
+function updateDirectionUi() {
+  const button = document.getElementById('directionMotionBtn');
+  if (button) button.textContent = getDirectionLabel();
+}
 function rotateVectorAroundAxis(vec, axis, angleRad) {
   const k = new THREE.Vector3(axis.x, axis.y, axis.z).normalize();
   const cos = Math.cos(angleRad), sin = Math.sin(angleRad);
@@ -298,7 +495,7 @@ function rotateVectorAroundAxis(vec, axis, angleRad) {
   return vec.clone().multiplyScalar(cos).add(cross.multiplyScalar(sin)).add(k.clone().multiplyScalar(dot * (1 - cos)));
 }
 function createOrbitPath(h_vec, perigeeDir, e) {
-  if (orbitPathLine) scene.remove(orbitPathLine);
+  orbitPathLine = removeFromScene(orbitPathLine);
   const e_x = perigeeDir.clone().normalize();
   const e_y = new THREE.Vector3().crossVectors(h_vec, e_x).normalize();
   const points = [];
@@ -313,7 +510,7 @@ function createOrbitPath(h_vec, perigeeDir, e) {
       const pt = e_x.clone().multiplyScalar(a * Math.cos(theta) - c).add(e_y.clone().multiplyScalar(b * Math.sin(theta)));
       points.push(pt);
     }
-    orbitPathLine = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({ color: 0xd6d9de, transparent: true, opacity: 0.9 }));
+    orbitPathLine = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({ color: 0x3a86ff, transparent: true, opacity: 0.85 }));
   } else {
     const nuAsymptote = Math.acos(Math.max(-0.9999, -1 / e));
     let lo = 0, hi = nuAsymptote - 0.0001;
@@ -333,7 +530,7 @@ function createOrbitPath(h_vec, perigeeDir, e) {
       if (!isFinite(r) || r > MAX_DRAW_R) continue;
       points.push(e_x.clone().multiplyScalar(r * Math.cos(nu)).add(e_y.clone().multiplyScalar(r * Math.sin(nu))));
     }
-    orbitPathLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({ color: 0xff88ff, transparent: true, opacity: 1 }));
+    orbitPathLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({ color: 0x3a86ff, transparent: true, opacity: 0.95 }));
   }
   scene.add(orbitPathLine);
 }
@@ -342,29 +539,50 @@ function updateVelocityDirectionArrow(satPos, perigeeDir, h_vec, nu_rad, e) {
     smallDirectionArrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), satPos, 0.55, 0xffffff, 0.11, 0.06);
     scene.add(smallDirectionArrow);
   }
-  const delta = 0.03;
-  const posAtNuPlus = rotateVectorAroundAxis(perigeeDir, h_vec, nu_rad + delta).normalize().multiplyScalar(getOrbitRadius(e, nu_rad + delta));
-  const forwardTangent = new THREE.Vector3().subVectors(posAtNuPlus, satPos).normalize();
-  const currentOmegaDeg = parseFloat(document.getElementById('omegaSlider').value);
-  const currentNuDeg = parseFloat(document.getElementById('nuSlider').value);
-  let dir = (currentOmegaDeg + currentNuDeg) < (prevOmegaDeg + prevNuDeg) ? -1 : 1;
-  const velocityDir = forwardTangent.clone().multiplyScalar(dir);
-  if (velocityDir.length() > 0.01) {
-    smallDirectionArrow.position.copy(satPos);
-    smallDirectionArrow.setDirection(velocityDir);
-    smallDirectionArrow.setColor(0xffffff);
-    smallDirectionArrow.setLength(0.58, 0.12, 0.065);
+  const e_x = perigeeDir.clone().normalize();
+  const e_y = new THREE.Vector3().crossVectors(h_vec, e_x).normalize();
+  const p = getSemiLatusRectum(e);
+  const denom = 1 + e * Math.cos(nu_rad);
+  if (denom <= 0.0001) {
+    smallDirectionArrow.visible = false;
+    return;
   }
-  prevOmegaDeg = currentOmegaDeg;
-  prevNuDeg = currentNuDeg;
+  const r = p / denom;
+  const drdNu = (p * e * Math.sin(nu_rad)) / (denom * denom);
+  const tangent = e_x.clone().multiplyScalar(drdNu * Math.cos(nu_rad) - r * Math.sin(nu_rad))
+    .add(e_y.clone().multiplyScalar(drdNu * Math.sin(nu_rad) + r * Math.cos(nu_rad)))
+    .multiplyScalar(getDirectionSign());
+  if (tangent.lengthSq() < 1e-10) {
+    smallDirectionArrow.visible = false;
+    return;
+  }
+  smallDirectionArrow.visible = true;
+  smallDirectionArrow.position.copy(satPos);
+  smallDirectionArrow.setDirection(tangent.normalize());
+  smallDirectionArrow.setColor(0xffffff);
+  smallDirectionArrow.setLength(0.48, 0.1, 0.055);
+}
+function predictNextNuRad(currentNuRad, e, deltaTime) {
+  const direction = getDirectionSign();
+  const delta = getMotionRate() * deltaTime * direction;
+  if (e < 1 - 1e-6) {
+    const M = meanAnomalyFromTrueAnomaly(currentNuRad, e);
+    return trueAnomalyFromMeanAnomaly(normalizeAngleRad(M + delta), e);
+  }
+  if (e > 1 + 1e-6) {
+    const M = meanAnomalyFromTrueAnomaly(currentNuRad, e);
+    return trueAnomalyFromMeanAnomaly(M + delta, e);
+  }
+  const M = meanAnomalyFromTrueAnomaly(currentNuRad, e);
+  return trueAnomalyFromMeanAnomaly(M + delta, e);
 }
 function bindAngleInputs() {
   const pairs = [
-    { slider: 'incSlider', input: 'incInput', min: 0, max: 180 },
-    { slider: 'OmegaSlider', input: 'OmegaInput', min: 0, max: 360 },
-    { slider: 'omegaSlider', input: 'omegaInput', min: 0, max: 360 },
-    { slider: 'nuSlider', input: 'nuInput', min: 0, max: 360 },
-    { slider: 'eccSlider', input: 'eccInput', min: 0, max: 2.0, isFloat: true },
+    { slider: 'incSlider', input: 'incInput', min: 0, max: 180, decimals: 0 },
+    { slider: 'OmegaSlider', input: 'OmegaInput', min: 0, max: 360, decimals: 0 },
+    { slider: 'omegaSlider', input: 'omegaInput', min: 0, max: 360, decimals: 0 },
+    { slider: 'nuSlider', input: 'nuInput', min: 0, max: 360, decimals: 1 },
+    { slider: 'eccSlider', input: 'eccInput', min: 0, max: 2.0, decimals: 2 },
   ];
   pairs.forEach(pair => {
     const slider = document.getElementById(pair.slider);
@@ -375,36 +593,29 @@ function bindAngleInputs() {
       let val = parseFloat(input.value);
       if (isNaN(val)) val = 0;
       val = Math.min(pair.max, Math.max(pair.min, val));
-      val = pair.isFloat ? Math.round(val * 100) / 100 : Math.round(val);
-      input.value = pair.isFloat ? val : String(val);
+      val = roundTo(val, pair.decimals);
+      input.value = val.toFixed(pair.decimals);
       slider.value = val;
       updateOrbit();
     });
   });
   const aSlider = document.getElementById('aSlider');
   const aInput = document.getElementById('aInput');
-  aSlider.addEventListener('input', () => { aInput.value = parseFloat(aSlider.value).toFixed(2); semiMajorA = parseFloat(aSlider.value); updateOrbit(); });
+  aSlider.addEventListener('input', () => {
+    aInput.value = parseFloat(aSlider.value).toFixed(2);
+    semiMajorA = parseFloat(aSlider.value);
+    orbitPerigeeRadius = Math.max(getPerigeeRadiusFromOrbit(semiMajorA, currentOrbitE), MIN_PERIGEE_RADIUS);
+    updateOrbit();
+  });
   aInput.addEventListener('change', () => {
     let val = parseFloat(aInput.value);
     if (isNaN(val)) val = 2.0;
-    val = Math.min(8.0, Math.max(1.2, Math.round(val * 100) / 100));
+    val = Math.min(30.0, Math.max(1.2, roundTo(val, VALUE_DECIMALS.a)));
     aInput.value = val.toFixed(2);
     aSlider.value = val;
     semiMajorA = val;
+    orbitPerigeeRadius = Math.max(getPerigeeRadiusFromOrbit(semiMajorA, currentOrbitE), MIN_PERIGEE_RADIUS);
     updateOrbit();
-  });
-  document.querySelectorAll('.arrow-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const slider = document.getElementById(btn.dataset.slider);
-      if (!slider) return;
-      const min = parseFloat(slider.min);
-      const max = parseFloat(slider.max);
-      const next = btn.dataset.action === 'min' ? min : max;
-      slider.value = next;
-      const input = document.getElementById(slider.id.replace('Slider', 'Input'));
-      if (input) input.value = slider.step && slider.step.includes('.') ? Number(next).toFixed(2) : String(Math.round(next));
-      updateOrbit();
-    });
   });
 }
 function updateOrbit(forceNuDeg = null) {
@@ -412,27 +623,58 @@ function updateOrbit(forceNuDeg = null) {
   const Omega_deg = parseFloat(document.getElementById('OmegaSlider').value);
   const omega_deg = parseFloat(document.getElementById('omegaSlider').value);
   const e = parseFloat(document.getElementById('eccSlider').value);
-  if (forceNuDeg !== null) document.getElementById('nuSlider').value = forceNuDeg.toFixed(0);
-  const nu_deg = parseFloat(document.getElementById('nuSlider').value);
-  semiMajorA = parseFloat(document.getElementById('aSlider').value);
+  const previousOrbitE = currentOrbitE;
+  currentOrbitE = e;
+  const orbitAdjusted = Math.abs(previousOrbitE - e) > 1e-6;
+  if (motionEnabled && Math.abs(previousOrbitE - e) > 1e-6) {
+    syncMotionFromTrueAnomaly(motionNuDeg, e);
+  }
+  const nuSourceDeg = forceNuDeg !== null ? forceNuDeg : (motionEnabled ? motionNuDeg : parseFloat(document.getElementById('nuSlider').value));
+  const nu_deg = motionEnabled || forceNuDeg !== null ? normalizeMotionAngleDeg(nuSourceDeg) : nuSourceDeg;
+  if (motionEnabled || forceNuDeg !== null) {
+    document.getElementById('nuSlider').value = nu_deg.toFixed(1);
+    document.getElementById('nuInput').value = nu_deg.toFixed(1);
+  }
+  if (Math.abs(previousOrbitE - e) > 1e-6) {
+    const denom = e < 1 - 1e-6 ? Math.max(1 - e, 1e-3) : e > 1 + 1e-6 ? Math.max(e - 1, 1e-3) : 1;
+    semiMajorA = roundTo(Math.max(orbitPerigeeRadius, MIN_PERIGEE_RADIUS) / denom, VALUE_DECIMALS.a);
+    const aSlider = document.getElementById('aSlider');
+    const aInput = document.getElementById('aInput');
+    if (aSlider) aSlider.value = semiMajorA.toFixed(2);
+    if (aInput) aInput.value = semiMajorA.toFixed(2);
+  } else {
+    semiMajorA = parseFloat(document.getElementById('aSlider').value);
+  }
+  orbitPerigeeRadius = Math.max(getPerigeeRadiusFromOrbit(semiMajorA, e), MIN_PERIGEE_RADIUS);
   document.getElementById('aVal').innerText = semiMajorA.toFixed(2);
+  lastInclinationDeg = i_deg;
+  updateDirectionUi();
+  updateMotionButtonLabel();
   const p = getSemiLatusRectum(e);
   let infoHtml = `p (semi-latus rectum) = ${p.toFixed(3)}<br>`;
+  if (orbitAdjusted) {
+    infoHtml += `orbit size adjusted to keep perigee outside Earth<br>`;
+  }
   if (e < 1.0) {
     const b = semiMajorA * Math.sqrt(1 - e * e);
     infoHtml += `b (semi-minor axis) = ${b.toFixed(3)}<br>`;
-    infoHtml += `r_perigee = ${(semiMajorA * (1 - e)).toFixed(3)}<br>`;
-    if (e > 0.001) infoHtml += `r_apogee = ${(semiMajorA * (1 + e)).toFixed(3)}<br>`;
+    if (e <= VISIBILITY_EPS) {
+      infoHtml += `circular orbit radius = ${semiMajorA.toFixed(3)}<br>`;
+      infoHtml += `perigee/apogee undefined for e = 0<br>`;
+    } else {
+      infoHtml += `r_perigee = ${(semiMajorA * (1 - e)).toFixed(3)}<br>`;
+      infoHtml += `r_apogee = ${(semiMajorA * (1 + e)).toFixed(3)}<br>`;
+    }
   } else if (Math.abs(e - 1.0) < 0.01) {
     infoHtml += `a = undefined (parabola)<br>r_perigee = ${(p / 2).toFixed(3)}<br>`;
   } else {
     infoHtml += `a is negative (hyperbola)<br>r_perigee = ${(semiMajorA * (e - 1)).toFixed(3)}<br>`;
   }
   document.getElementById('orbitInfoBox').innerHTML = infoHtml;
-  document.getElementById('iVal').innerText = i_deg + "°";
-  document.getElementById('OmegaVal').innerText = Omega_deg + "°";
-  document.getElementById('omegaVal').innerText = omega_deg + "°";
-  document.getElementById('nuVal').innerText = nu_deg + "°";
+  document.getElementById('iVal').innerText = formatAngleText(i_deg);
+  document.getElementById('OmegaVal').innerText = formatAngleText(Omega_deg);
+  document.getElementById('omegaVal').innerText = formatAngleText(omega_deg);
+  document.getElementById('nuVal').innerText = formatAngleText(nu_deg, ANGLE_DECIMALS);
   document.getElementById('eVal').innerText = e.toFixed(2);
   const badge = document.getElementById('eccBadge');
   if (e === 0) { badge.textContent = "● Circular"; badge.style.background = "#1a3a2a"; badge.style.color = "#44ffaa"; }
@@ -453,7 +695,7 @@ function updateOrbit(forceNuDeg = null) {
   if (specialAngles.includes(omega_deg % 360)) omegaOmegaMsg += "🟢 " + ({0:"ω=0° Perigee on Nodes.",90:"ω=90° Perigee ⊥ Nodes.",180:"ω=180° Perigee opposite Nodes.",270:"ω=270° anti-perpendicular."})[omega_deg%360];
   if (!omegaOmegaMsg) omegaOmegaMsg = "✨ Adjust Ω and ω for special alignments.";
   document.getElementById('specialAnglesMsg').innerHTML = omegaOmegaMsg;
-  document.getElementById('dynamicStatus').innerHTML = `🛰️ i=${i_deg}° Ω=${Omega_deg}° ω=${omega_deg}° ν=${nu_deg}° e=${e.toFixed(2)}`;
+  document.getElementById('dynamicStatus').innerHTML = `🛰️ i=${i_deg}° Ω=${Omega_deg}° ω=${omega_deg}° ν=${nu_deg.toFixed(1)}° e=${e.toFixed(2)}`;
   document.getElementById('specialCaseMsg').innerHTML = specialMsg;
   let nodeDir = new THREE.Vector3(Math.cos(Omega_rad), Math.sin(Omega_rad), 0);
   let h_vec;
@@ -462,51 +704,86 @@ function updateOrbit(forceNuDeg = null) {
   else h_vec = new THREE.Vector3(Math.sin(i_rad) * Math.sin(Omega_rad), -Math.sin(i_rad) * Math.cos(Omega_rad), Math.cos(i_rad)).normalize();
   let perigeeDir = isEquatorial ? rotateVectorAroundAxis(nodeDir, new THREE.Vector3(0,0,1), omega_rad) : rotateVectorAroundAxis(nodeDir, h_vec, omega_rad);
   perigeeDir.normalize();
-  const currentNuDeg = motionEnabled ? motionAngleDeg : nu_deg;
+  const currentNuDeg = motionEnabled ? motionNuDeg : nu_deg;
   const currentNuRad = currentNuDeg * Math.PI / 180;
   const r = getOrbitRadius(e, currentNuRad);
   const satDir = rotateVectorAroundAxis(perigeeDir, h_vec, currentNuRad).normalize();
   const satPos = satDir.clone().multiplyScalar(isFinite(r) ? r : MAX_DRAW_R);
-  createOrbitPath(h_vec, perigeeDir, e);
-  if (orbitalDisc) {
-    const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), h_vec.clone().normalize());
-    orbitalDisc.quaternion.copy(quat);
-    orbitalDisc.position.set(0, 0, 0);
+  const showNodes = !(Math.abs(i_deg) < eps || Math.abs(i_deg - 180) < eps);
+  const showPerigee = e > VISIBILITY_EPS;
+  const orbitSignature = [
+    semiMajorA.toFixed(2),
+    e.toFixed(2),
+    i_deg.toFixed(1),
+    Omega_deg.toFixed(1),
+    omega_deg.toFixed(1),
+    showNodes ? "nodes" : "equatorial",
+    showPerigee ? "perigee" : "circular"
+  ].join('|');
+  if (orbitSignature !== orbitStaticSignature) {
+    orbitStaticSignature = orbitSignature;
+    createOrbitPath(h_vec, perigeeDir, e);
+    if (orbitalDisc) {
+      const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), h_vec.clone().normalize());
+      orbitalDisc.quaternion.copy(quat);
+      orbitalDisc.position.set(0, 0, 0);
+    }
+    if (nodeLineObj) nodeLineObj = removeFromScene(nodeLineObj);
+    nodeSpheres.forEach(sp => removeFromScene(sp));
+    nodeSpheres = [];
+    if (showNodes) {
+      const nodeLen = 2.55;
+      nodeLineObj = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([nodeDir.clone().multiplyScalar(-nodeLen), nodeDir.clone().multiplyScalar(nodeLen)]),
+        new THREE.LineBasicMaterial({ color: 0xff4466, transparent: true, opacity: 0.8 })
+      );
+      scene.add(nodeLineObj);
+      const sGeo = new THREE.SphereGeometry(0.045, 10, 10);
+      const sMat = new THREE.MeshStandardMaterial({ color: 0xff8888 });
+      const mA = new THREE.Mesh(sGeo, sMat);
+      const mD = new THREE.Mesh(sGeo, sMat.clone());
+      mA.position.copy(nodeDir.clone().multiplyScalar(nodeLen));
+      mD.position.copy(nodeDir.clone().multiplyScalar(-nodeLen));
+      scene.add(mA);
+      scene.add(mD);
+      nodeSpheres = [mA, mD];
+    }
+    perigeeArrow = removeFromScene(perigeeArrow);
+    perigeeLabel = removeFromScene(perigeeLabel);
+    hArrow = removeFromScene(hArrow);
+    hLabel = removeFromScene(hLabel);
+    if (showPerigee) {
+      perigeeArrow = new THREE.ArrowHelper(perigeeDir, originPt, 2.25, 0x00ffff, 0.09, 0.045);
+      scene.add(perigeeArrow);
+      perigeeLabel = createTextLabel("Perigee", perigeeDir.clone().multiplyScalar(2.88), "#00ffff");
+    }
+    hArrow = new THREE.ArrowHelper(h_vec, originPt, 2.55, 0xffaa44, 0.095, 0.055);
+    scene.add(hArrow);
+    hLabel = createTextLabel("h vector", h_vec.clone().multiplyScalar(3.02), "#ffaa44");
   }
+  if (!satelliteMarker) {
+    satelliteMarker = createEmojiSprite("🛰", satPos, 0.66, 230);
+  } else {
+    satelliteMarker.position.copy(satPos);
+  }
+  if (!satelliteLine) {
+    satelliteLine = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([originPt.clone(), satPos]),
+      new THREE.LineBasicMaterial({ color: 0x88aaff, transparent: true, opacity: 0.55 })
+    );
+    scene.add(satelliteLine);
+  } else {
+    updateLineGeometry(satelliteLine, originPt, satPos);
+  }
+  if (!satGlow) {
+    satGlow = new THREE.Mesh(
+      new THREE.SphereGeometry(0.16, 12, 12),
+      new THREE.MeshBasicMaterial({ color: 0xff6644, transparent: true, opacity: 0.15 })
+    );
+    scene.add(satGlow);
+  }
+  satGlow.position.copy(satPos);
   updateVelocityDirectionArrow(satPos, perigeeDir, h_vec, currentNuRad, e);
-  if (nodeLineObj) scene.remove(nodeLineObj);
-  const nodeLen = 2.55;
-  nodeLineObj = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints([nodeDir.clone().multiplyScalar(-nodeLen), nodeDir.clone().multiplyScalar(nodeLen)]),
-    new THREE.LineBasicMaterial({ color: 0xff4466, transparent: true, opacity: 0.8 })
-  );
-  scene.add(nodeLineObj);
-  if (window.nodeSpheres) window.nodeSpheres.forEach(sp => scene.remove(sp));
-  const sGeo = new THREE.SphereGeometry(0.05, 10, 10);
-  const sMat = new THREE.MeshStandardMaterial({ color: 0xff8888 });
-  const mA = new THREE.Mesh(sGeo, sMat); mA.position.copy(nodeDir.clone().multiplyScalar(nodeLen));
-  const mD = new THREE.Mesh(sGeo, sMat); mD.position.copy(nodeDir.clone().multiplyScalar(-nodeLen));
-  scene.add(mA); scene.add(mD); window.nodeSpheres = [mA, mD];
-  if (perigeeArrow) scene.remove(perigeeArrow);
-  perigeeArrow = new THREE.ArrowHelper(perigeeDir, originPt, 2.35, 0x00ffff, 0.11, 0.06);
-  scene.add(perigeeArrow);
-  if (perigeeLabel) scene.remove(perigeeLabel);
-  perigeeLabel = createTextLabel("Perigee", perigeeDir.clone().multiplyScalar(2.65), "#00ffff");
-  if (hArrow) scene.remove(hArrow);
-  hArrow = new THREE.ArrowHelper(h_vec, originPt, 2.7, 0xffaa44, 0.125, 0.08);
-  scene.add(hArrow);
-  if (hLabel) scene.remove(hLabel);
-  hLabel = createTextLabel("h vector", h_vec.clone().multiplyScalar(3.0), "#ffaa44");
-  if (satelliteMarker) scene.remove(satelliteMarker);
-  if (satelliteLine) scene.remove(satelliteLine);
-  if (window.satGlow) scene.remove(window.satGlow);
-  satelliteMarker = createEmojiSprite("🛰", satPos, 0.66, 230);
-  satelliteLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), satPos]), new THREE.LineBasicMaterial({ color: 0x88aaff, transparent: true, opacity: 0.55 }));
-  scene.add(satelliteLine);
-  const glow = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 12), new THREE.MeshBasicMaterial({ color: 0xff6644, transparent: true, opacity: 0.15 }));
-  glow.position.copy(satPos);
-  scene.add(glow);
-  window.satGlow = glow;
 }
 
 function createStarfield() {
@@ -548,19 +825,27 @@ document.getElementById('toggleControlsBtn').addEventListener('click', () => {
   const hidden = panel.classList.toggle('is-hidden');
   document.getElementById('toggleControlsBtn').textContent = hidden ? 'Show Panel' : 'Hide Panel';
 });
-document.getElementById('stopMotionBtn').addEventListener('click', () => {
-  motionEnabled = false;
-  orbitDirection = 1;
-  document.getElementById('progradeMotionBtn').classList.remove('is-active');
-  document.getElementById('retrogradeMotionBtn').classList.remove('is-active');
+document.getElementById('directionMotionBtn').addEventListener('click', () => {
+  orbitDirection *= -1;
+  updateDirectionUi();
+  updateOrbit();
+});
+
+document.getElementById('motionToggleBtn').addEventListener('click', () => {
+  motionEnabled = !motionEnabled;
+  if (motionEnabled) {
+    syncMotionFromTrueAnomaly(parseFloat(document.getElementById('nuSlider').value), currentOrbitE);
+  } else {
+    document.getElementById('nuSlider').value = motionNuDeg.toFixed(1);
+    document.getElementById('nuInput').value = motionNuDeg.toFixed(1);
+  }
+  updateMotionButtonLabel();
   updateOrbit();
 });
 
 document.getElementById('resetBtn').addEventListener('click', () => {
   motionEnabled = false;
   orbitDirection = 1;
-  document.getElementById('progradeMotionBtn').classList.remove('is-active');
-  document.getElementById('retrogradeMotionBtn').classList.remove('is-active');
   document.getElementById('aSlider').value = defaultState.a;
   document.getElementById('aInput').value = defaultState.a.toFixed(2);
   document.getElementById('eccSlider').value = defaultState.e;
@@ -571,26 +856,14 @@ document.getElementById('resetBtn').addEventListener('click', () => {
   document.getElementById('OmegaInput').value = defaultState.Omega;
   document.getElementById('omegaSlider').value = defaultState.omega;
   document.getElementById('omegaInput').value = defaultState.omega;
-  document.getElementById('nuSlider').value = defaultState.nu;
-  document.getElementById('nuInput').value = defaultState.nu;
+  document.getElementById('nuSlider').value = defaultState.nu.toFixed(1);
+  document.getElementById('nuInput').value = defaultState.nu.toFixed(1);
   semiMajorA = defaultState.a;
-  motionAngleDeg = defaultState.nu;
-  updateOrbit();
-});
-
-document.getElementById('progradeMotionBtn').addEventListener('click', () => {
-  motionEnabled = true;
-  orbitDirection = 1;
-  document.getElementById('progradeMotionBtn').classList.add('is-active');
-  document.getElementById('retrogradeMotionBtn').classList.remove('is-active');
-  updateOrbit();
-});
-
-document.getElementById('retrogradeMotionBtn').addEventListener('click', () => {
-  motionEnabled = true;
-  orbitDirection = -1;
-  document.getElementById('retrogradeMotionBtn').classList.add('is-active');
-  document.getElementById('progradeMotionBtn').classList.remove('is-active');
+  orbitPerigeeRadius = Math.max(defaultState.a * (1 - defaultState.e), MIN_PERIGEE_RADIUS);
+  syncMotionFromTrueAnomaly(defaultState.nu, defaultState.e);
+  lastInclinationDeg = defaultState.i;
+  updateMotionButtonLabel();
+  updateDirectionUi();
   updateOrbit();
 });
 
@@ -600,8 +873,8 @@ function animate(now) {
   const dt = Math.min((now - lastTime) / 1000, 0.05);
   lastTime = now;
   if (motionEnabled) {
-    motionAngleDeg = (motionAngleDeg + orbitDirection * motionSpeedDegPerSec * dt) % 360;
-    updateOrbit(motionAngleDeg);
+    advanceMotionPhase(dt, currentOrbitE);
+    updateOrbit(motionNuDeg);
   }
   updateEarthRotation();
   controls.update();
